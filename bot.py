@@ -43,6 +43,7 @@ BOT_USERNAME = None
 def kb_menu(state=None):
     """Контекстная reply-клавиатура с командами."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("📋 Меню"))
     if state == "PLACING":
         kb.row(types.KeyboardButton("/replace"), types.KeyboardButton("/ready"))
         kb.row(types.KeyboardButton("/surrender"))
@@ -439,6 +440,11 @@ async def cmd_start(message: types.Message):
 
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
+    await _send_help(message)
+
+
+@dp.message_handler(lambda m: (m.text or "").strip() == "📋 Меню")
+async def menu_button(message: types.Message):
     await _send_help(message)
 
 
