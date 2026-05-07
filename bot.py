@@ -83,10 +83,53 @@ _join_attempts: dict = {}
 TURN_TIMEOUT_SEC = 600  # 10 минут на ход; иначе автопоражение
 # code -> asyncio.Task
 _turn_timers: dict = {}
+CHAT_COOLDOWN_SEC = 2
+_chat_last_sent: dict = {}
 
 # Пауза перед стартом polling, чтобы Telegram освободил предыдущий
 # getUpdates после редеплоя на Railway (иначе TerminatedByOtherGetUpdates).
 STARTUP_DELAY_SEC = int(os.getenv("STARTUP_DELAY_SEC", "15"))
+
+START_ATTACKER_LINES = [
+    "🚨 <b>БОЙ НАЧАЛСЯ</b>\n🔫 Твой первый залп! Введи координату, например <code>B7</code>.",
+    "🚨 <b>К БОЮ!</b>\n🎯 Ты начинаешь. Целься и отправляй координату, например <code>B7</code>.",
+    "⚓ <b>Сражение стартовало</b>\n💥 Первый выстрел за тобой: <code>A1</code>, <code>B7</code> и т.д.",
+]
+START_DEFENDER_LINES = [
+    "🚨 <b>БОЙ НАЧАЛСЯ</b>\n⏳ Первый ход за соперником. Готовься!",
+    "⚓ <b>Сражение стартовало</b>\n🛡️ Соперник стреляет первым.",
+    "🚨 <b>К БОЮ!</b>\n⏳ Ждём первый выстрел соперника.",
+]
+MISS_SHOOTER_LINES = [
+    "🌊 МИМО: <code>{coord}</code>\n⏳ Ход переходит сопернику.",
+    "💨 Выстрел в <code>{coord}</code> ушёл в воду.\n⏳ Теперь ход соперника.",
+    "🌊 Пусто по <code>{coord}</code>.\n⏳ Инициатива у соперника.",
+]
+MISS_DEFENDER_LINES = [
+    "💨 Соперник промахнулся в <code>{coord}</code>.\n🔫 Твой ход!",
+    "🌊 По клетке <code>{coord}</code> — мимо.\n🎯 Отвечай залпом!",
+    "🛡️ Промах соперника: <code>{coord}</code>.\n🔫 Твоя очередь стрелять.",
+]
+HIT_SHOOTER_LINES = [
+    "🎯 ПОПАДАНИЕ: <code>{coord}</code>\n🔥 Корабль ранен, стреляй ещё!",
+    "🎯 Точно в цель: <code>{coord}</code>\n🚀 Продолжай атаку!",
+    "💥 Есть контакт: <code>{coord}</code>\n🔥 Корабль соперника ранен!",
+]
+HIT_DEFENDER_LINES = [
+    "⚠️ Попадание по твоему кораблю: <code>{coord}</code>.\n⏳ Соперник продолжает ход.",
+    "💥 В тебя попали: <code>{coord}</code>.\n⏳ Ждём следующий выстрел соперника.",
+    "⚠️ Корабль ранен в точке <code>{coord}</code>.\n⏳ Ход ещё у соперника.",
+]
+KILL_SHOOTER_LINES = [
+    "💥 КОРАБЛЬ ПОТОПЛЕН: <code>{coord}</code>\n🚀 Добивай, ход всё ещё твой!",
+    "🔥 Цель уничтожена: <code>{coord}</code>\n🎯 Продолжай огонь!",
+    "💣 Потопил корабль в <code>{coord}</code>!\n🚀 Инициатива остаётся у тебя.",
+]
+KILL_DEFENDER_LINES = [
+    "💥 Один из твоих кораблей потоплен в <code>{coord}</code>.\n⏳ Соперник продолжает ход.",
+    "🔥 Твой корабль уничтожен: <code>{coord}</code>.\n⏳ Ждём следующий выстрел соперника.",
+    "💣 Соперник потопил корабль в <code>{coord}</code>.\n⏳ Ход по-прежнему за ним.",
+]
 
 
 def join_allowed(user_id):
@@ -97,6 +140,16 @@ def join_allowed(user_id):
     if len(buf) >= JOIN_MAX_ATTEMPTS:
         return False
     buf.append(now)
+    return True
+
+
+def chat_allowed(user_id):
+    import time
+    now = time.monotonic()
+    last = _chat_last_sent.get(user_id)
+    if last is not None and now - last < CHAT_COOLDOWN_SEC:
+        return False
+    _chat_last_sent[user_id] = now
     return True
 
 # code -> game dict
@@ -324,10 +377,8 @@ def parse_move(text):
 
 
 def render(player, show_ships):
-    """Однобайтный grid: каждая клетка — 1 ASCII-символ, разделитель — пробел.
-    Рамки и штриховка убраны: в мобильных моно-шрифтах Telegram они плывут.
-    """
-    EMPTY, SHIP, HIT, MISS = ".", "#", "X", "o"
+    """Компактный grid: каждая клетка — 1 символ, разделитель — пробел."""
+    EMPTY, SHIP, HIT, MISS = "·", "■", "✕", "○"
     header = "   " + " ".join(LETTERS)
     lines = [header]
     for y in range(FIELD):
@@ -372,19 +423,43 @@ def reroll(player):
     player["ships_cells"] = [s["orig"] for s in player["ships"]]
 
 
+def fleet_status(player):
+    alive = sum(1 for ship in player["ships"] if ship["alive"])
+    sunk = len(player["ships"]) - alive
+    return f"🚢 Корабли: {alive}/10 в строю ({sunk} потоплено)"
+
+
+def fleet_bar(player):
+    alive = sum(1 for ship in player["ships"] if ship["alive"])
+    return "🟩" * alive + "⬜" * (10 - alive)
+
+
 async def send_boards(game, user_id, prefix="", reply_markup=None):
     p = game["players"][user_id]
     own = render(p, show_ships=True)
     has_opponent = len(game["players"]) >= 2
     if has_opponent and game["state"] == "PLAYING":
         enemy = render(p, show_ships=False)
+        opp_id = other(game, user_id)
+        opp = game["players"][opp_id]
         text = (
-            f"{prefix}\n"
-            f"🎯 Поле противника (твои выстрелы):\n{enemy}\n"
-            f"🚢 Твоё поле:\n{own}"
+            f"{prefix}\n\n"
+            f"{fleet_status(p)}\n"
+            f"{fleet_bar(p)}\n"
+            f"🎯 У соперника в строю: {sum(1 for ship in opp['ships'] if ship['alive'])}/10\n\n"
+            f"{fleet_bar(opp)}\n\n"
+            f"<b>🎯 Поле противника</b> <i>(твои выстрелы)</i>\n{enemy}\n\n"
+            f"<b>🚢 Твоё поле</b>\n{own}\n\n"
+            f"<i>Легенда:</i> <code>■</code> корабль, <code>✕</code> попадание, "
+            f"<code>○</code> промах, <code>·</code> пусто"
         )
     else:
-        text = f"{prefix}\n🚢 Твоё поле:\n{own}"
+        text = (
+            f"{prefix}\n\n"
+            f"<b>🚢 Твоё поле</b>\n{own}\n\n"
+            f"<i>Легенда:</i> <code>■</code> корабль, <code>✕</code> попадание, "
+            f"<code>○</code> промах, <code>·</code> пусто"
+        )
     await bot.send_message(
         user_id, text, parse_mode="HTML", reply_markup=reply_markup
     )
@@ -409,15 +484,19 @@ def safe_reroll(player):
 
 
 HELP_TEXT = (
-    "🚢 <b>Морской бой</b>\n\n"
-    "/new — создать игру и позвать друга\n"
-    "/join КОД — присоединиться по коду вручную\n"
-    "/replace — перекинуть расстановку\n"
-    "/ready — готов к бою\n"
-    "/surrender — сдаться\n\n"
-    "Ход вводится координатой: <code>A1</code>, <code>B7</code>, <code>J10</code>\n"
-    "Обозначения: <code>#</code> — твой корабль, <code>X</code> — попадание, "
-    "<code>o</code> — промах, <code>.</code> — пусто."
+    "🚢 <b>Морской бой</b>\n"
+    "━━━━━━━━━━━━━━━\n\n"
+    "<b>Команды</b>\n"
+    "• <code>/new</code> — создать игру\n"
+    "• <code>/join КОД</code> — войти по коду\n"
+    "• <code>/replace</code> — новая расстановка\n"
+    "• <code>/ready</code> — подтвердить готовность\n"
+    "• <code>/chat текст</code> — написать сопернику\n"
+    "• <code>/surrender</code> — сдаться\n\n"
+    "<b>Как ходить</b>\n"
+    "Отправь координату: <code>A1</code>, <code>B7</code>, <code>J10</code>\n\n"
+    "<b>Легенда поля</b>\n"
+    "<code>■</code> корабль  <code>✕</code> попадание  <code>○</code> промах  <code>·</code> пусто"
 )
 
 
@@ -477,14 +556,15 @@ async def cmd_new(message: types.Message):
     await save_game(code)
     log.info("game created code=%s host=%s", code, uid)
     await send_boards(
-        game, uid, f"🎲 Игра создана. Код: <code>{code}</code>\nТвоя расстановка:",
+        game, uid, f"🎲 <b>Игра создана</b>\nКод приглашения: <code>{code}</code>\n\nТвоя расстановка:",
         reply_markup=kb_menu("PLACING"),
     )
     deep = f"https://t.me/{BOT_USERNAME}?start={code}"
     await bot.send_message(
         uid,
-        f"Позови соперника — кнопка ниже откроет список контактов Telegram.\n"
-        f"Ссылка для ручной отправки: {deep}",
+        f"📨 <b>Пригласи соперника</b>\n"
+        f"Кнопка ниже откроет список контактов Telegram.\n\n"
+        f"Ссылка для ручной отправки:\n{deep}",
         parse_mode="HTML",
         reply_markup=kb_invite(code),
         disable_web_page_preview=True,
@@ -535,7 +615,8 @@ async def _try_join(message: types.Message, code: str):
     await save_game(code)
     log.info("player %s joined code=%s", uid, code)
     await message.reply(
-        "✅ Присоединился. /replace — перекинуть расстановку, /ready — готов к бою.",
+        "✅ <b>Ты в игре!</b>\n/replace — перекинуть расстановку\n/ready — готов к бою",
+        parse_mode="HTML",
         reply_markup=kb_menu("PLACING"),
     )
     await send_boards(game, uid, "Твоя расстановка:")
@@ -623,11 +704,16 @@ async def cmd_ready(message: types.Message):
         await message.reply("✔ Готов.", reply_markup=kb_menu("PLAYING"))
         await bot.send_message(
             first,
-            f"🔫 Твой ход. Координата, например B7. На ход — {TURN_TIMEOUT_SEC // 60} мин.",
+            f"{random.choice(START_ATTACKER_LINES)}\n"
+            f"⌛ Лимит на ход: {TURN_TIMEOUT_SEC // 60} минут.",
+            parse_mode="HTML",
             reply_markup=kb_menu("PLAYING"),
         )
         await bot.send_message(
-            second, "⏳ Ход соперника.", reply_markup=kb_menu("PLAYING")
+            second,
+            random.choice(START_DEFENDER_LINES),
+            parse_mode="HTML",
+            reply_markup=kb_menu("PLAYING"),
         )
     else:
         await save_game(code)
@@ -661,6 +747,36 @@ async def cmd_surrender(message: types.Message):
                 pass
     games.pop(code, None)
     await delete_game(code)
+
+
+@dp.message_handler(commands=["chat", "say"])
+async def cmd_chat(message: types.Message):
+    uid = message.from_user.id
+    code = user_game.get(uid)
+    if not code or code not in games:
+        await message.reply("Ты не в игре.", reply_markup=kb_menu())
+        return
+    game = games[code]
+    if len(game["players"]) < 2:
+        await message.reply("Соперник ещё не подключился.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("Формат: /chat ТВОЁ_СООБЩЕНИЕ")
+        return
+    text = parts[1].strip()
+    if len(text) > 300:
+        await message.reply("Слишком длинно. До 300 символов.")
+        return
+    if not chat_allowed(uid):
+        await message.reply(f"Не так быстро 🙂 Подожди {CHAT_COOLDOWN_SEC} сек.")
+        return
+    opp_id = other(game, uid)
+    try:
+        await bot.send_message(opp_id, f"💬 <b>Сообщение от соперника:</b>\n{text}", parse_mode="HTML")
+        await message.reply("✅ Отправлено.")
+    except Exception:
+        await message.reply("Не удалось отправить сообщение сопернику.")
 
 
 @dp.message_handler()
@@ -704,8 +820,8 @@ async def handle_move(message: types.Message):
         game["turn"] = opp_id
         await save_game(code)
         schedule_turn_timer(code)
-        await send_boards(game, uid, f"🌊 Мимо ({coord_name}). Ход соперника.")
-        await send_boards(game, opp_id, f"Соперник стрелял {coord_name} — мимо. Твой ход.")
+        await send_boards(game, uid, random.choice(MISS_SHOOTER_LINES).format(coord=coord_name))
+        await send_boards(game, opp_id, random.choice(MISS_DEFENDER_LINES).format(coord=coord_name))
         return
 
     hit_ship["alive"].remove(move)
@@ -715,8 +831,8 @@ async def handle_move(message: types.Message):
     if hit_ship["alive"]:
         await save_game(code)
         schedule_turn_timer(code)
-        await send_boards(game, uid, f"🎯 Ранил ({coord_name})! Стреляй ещё.")
-        await send_boards(game, opp_id, f"Соперник ранил ({coord_name}). Ждём его хода.")
+        await send_boards(game, uid, random.choice(HIT_SHOOTER_LINES).format(coord=coord_name))
+        await send_boards(game, opp_id, random.choice(HIT_DEFENDER_LINES).format(coord=coord_name))
         return
 
     # killed: auto-mark border as misses
@@ -734,20 +850,20 @@ async def handle_move(message: types.Message):
         games.pop(code, None)
         await delete_game(code)
         await send_boards(
-            game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!",
+            game, uid, f"💥 КОРАБЛЬ УНИЧТОЖЕН: <code>{coord_name}</code>\n🏆 <b>ПОБЕДА!</b>",
             reply_markup=kb_menu(),
         )
         await send_boards(
             game, opp_id,
-            f"Соперник убил корабль {coord_name}.\n💀 Поражение.",
+            f"💥 Соперник добил корабль в <code>{coord_name}</code>.\n💀 <b>Поражение.</b>",
             reply_markup=kb_menu(),
         )
         return
 
     await save_game(code)
     schedule_turn_timer(code)
-    await send_boards(game, uid, f"💥 Убил ({coord_name})! Стреляй ещё.")
-    await send_boards(game, opp_id, f"Соперник убил корабль ({coord_name}). Ждём его хода.")
+    await send_boards(game, uid, random.choice(KILL_SHOOTER_LINES).format(coord=coord_name))
+    await send_boards(game, opp_id, random.choice(KILL_DEFENDER_LINES).format(coord=coord_name))
 
 
 async def on_startup(dispatcher):
@@ -767,6 +883,7 @@ async def on_startup(dispatcher):
             types.BotCommand("join", "Войти по коду"),
             types.BotCommand("replace", "Перекинуть расстановку"),
             types.BotCommand("ready", "Готов к бою"),
+            types.BotCommand("chat", "Сообщение сопернику"),
             types.BotCommand("surrender", "Сдаться"),
             types.BotCommand("help", "Помощь"),
         ])
